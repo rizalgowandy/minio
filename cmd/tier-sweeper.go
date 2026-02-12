@@ -18,11 +18,9 @@
 package cmd
 
 import (
-	"net/http"
-	"strings"
+	"context"
 
 	"github.com/minio/minio/internal/bucket/lifecycle"
-	xhttp "github.com/minio/minio/internal/http"
 )
 
 // objSweeper determines if a transitioned object needs to be removed from the remote tier.
@@ -31,19 +29,21 @@ import (
 // // Perform a ObjectLayer.GetObjectInfo to fetch object version information
 // goiOpts := os.GetOpts()
 // gerr := objAPI.GetObjectInfo(ctx, bucket, object, goiOpts)
-// if gerr == nil {
-//    os.SetTransitionState(goi)
-// }
+//
+//	if gerr == nil {
+//	   os.SetTransitionState(goi)
+//	}
 //
 // // After the overwriting object operation is complete.
-// if jentry, ok := os.ShouldRemoveRemoteObject(); ok {
-//     err := globalTierJournal.AddEntry(jentry)
-//     logger.LogIf(ctx, err)
-// }
+//
+//	if jentry, ok := os.ShouldRemoveRemoteObject(); ok {
+//	    err := globalTierJournal.AddEntry(jentry)
+//	    logger.LogIf(ctx, err)
+//	}
 type objSweeper struct {
 	Object              string
 	Bucket              string
-	ReqVersion          string // version ID set by application, applies only to DeleteObject and DeleteObjects APIs
+	VersionID           string // version ID set by application, applies only to DeleteObject and DeleteObjects APIs
 	Versioned           bool
 	Suspended           bool
 	TransitionStatus    string
@@ -55,46 +55,22 @@ type objSweeper struct {
 // newObjSweeper returns an objSweeper for a given bucket and object.
 // It initializes the versioning information using bucket name.
 func newObjSweeper(bucket, object string) *objSweeper {
-	versioned := globalBucketVersioningSys.Enabled(bucket)
-	suspended := globalBucketVersioningSys.Suspended(bucket)
 	return &objSweeper{
-		Object:    object,
-		Bucket:    bucket,
-		Versioned: versioned,
-		Suspended: suspended,
+		Object: object,
+		Bucket: bucket,
 	}
 }
 
-// versionIDer interface is used to fetch object versionIDer from disparate sources
-// like http.Request and ObjectToDelete.
-type versionIDer interface {
-	GetVersionID() string
-}
-
-// multiDelete is a type alias for ObjectToDelete to implement versionID
-// interface
-type multiDelete ObjectToDelete
-
-// GetVersionID returns object version of an object to be deleted via
-// multi-delete API.
-func (md multiDelete) GetVersionID() string {
-	return md.VersionID
-}
-
-// singleDelete is a type alias for http.Request to implement versionID
-// interface
-type singleDelete http.Request
-
-// GetVersionID returns object version of an object to be deleted via (simple)
-// delete API. Note only when the versionID is set explicitly by the application
-// will we return a non-empty versionID.
-func (sd singleDelete) GetVersionID() string {
-	return strings.TrimSpace(sd.URL.Query().Get(xhttp.VersionID))
-}
-
 // WithVersion sets the version ID from v
-func (os *objSweeper) WithVersion(v versionIDer) *objSweeper {
-	os.ReqVersion = v.GetVersionID()
+func (os *objSweeper) WithVersion(vid string) *objSweeper {
+	os.VersionID = vid
+	return os
+}
+
+// WithVersioning sets bucket versioning for sweeper.
+func (os *objSweeper) WithVersioning(versioned, suspended bool) *objSweeper {
+	os.Versioned = versioned
+	os.Suspended = suspended
 	return os
 }
 
@@ -102,22 +78,22 @@ func (os *objSweeper) WithVersion(v versionIDer) *objSweeper {
 // overwritten or deleted depending on bucket versioning status.
 func (os *objSweeper) GetOpts() ObjectOptions {
 	opts := ObjectOptions{
-		VersionID:        os.ReqVersion,
+		VersionID:        os.VersionID,
 		Versioned:        os.Versioned,
 		VersionSuspended: os.Suspended,
 	}
-	if os.Suspended && os.ReqVersion == "" {
+	if os.Suspended && os.VersionID == "" {
 		opts.VersionID = nullVersionID
 	}
 	return opts
 }
 
 // SetTransitionState sets ILM transition related information from given info.
-func (os *objSweeper) SetTransitionState(info ObjectInfo) {
-	os.TransitionTier = info.TransitionTier
-	os.TransitionStatus = info.TransitionStatus
-	os.RemoteObject = info.transitionedObjName
-	os.TransitionVersionID = info.transitionVersionID
+func (os *objSweeper) SetTransitionState(info TransitionedObject) {
+	os.TransitionTier = info.Tier
+	os.TransitionStatus = info.Status
+	os.RemoteObject = info.Name
+	os.TransitionVersionID = info.VersionID
 }
 
 // shouldRemoveRemoteObject determines if a transitioned object should be
@@ -140,7 +116,7 @@ func (os *objSweeper) shouldRemoveRemoteObject() (jentry, bool) {
 	switch {
 	case !os.Versioned, os.Suspended: // 1, 2.a, 2.b
 		delTier = true
-	case os.Versioned && os.ReqVersion != "": // 3.a
+	case os.Versioned && os.VersionID != "": // 3.a
 		delTier = true
 	}
 	if delTier {
@@ -154,9 +130,22 @@ func (os *objSweeper) shouldRemoveRemoteObject() (jentry, bool) {
 }
 
 // Sweep removes the transitioned object if it's no longer referred to.
-func (os *objSweeper) Sweep() error {
+func (os *objSweeper) Sweep() {
 	if je, ok := os.shouldRemoveRemoteObject(); ok {
-		return globalTierJournal.AddEntry(je)
+		globalExpiryState.enqueueTierJournalEntry(je)
 	}
-	return nil
+}
+
+type jentry struct {
+	ObjName   string
+	VersionID string
+	TierName  string
+}
+
+func deleteObjectFromRemoteTier(ctx context.Context, objName, rvID, tierName string) error {
+	w, err := globalTierConfigMgr.getDriver(ctx, tierName)
+	if err != nil {
+		return err
+	}
+	return w.Remove(ctx, objName, remoteVersionID(rvID))
 }

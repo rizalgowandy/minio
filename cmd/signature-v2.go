@@ -78,7 +78,9 @@ const (
 // http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationStringToSign
 func doesPolicySignatureV2Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	accessKey := formValues.Get(xhttp.AmzAccessKeyID)
-	cred, _, s3Err := checkKeyValid(accessKey)
+
+	r := &http.Request{Header: formValues}
+	cred, _, s3Err := checkKeyValid(r, accessKey)
 	if s3Err != ErrNone {
 		return cred, s3Err
 	}
@@ -93,7 +95,7 @@ func doesPolicySignatureV2Match(formValues http.Header) (auth.Credentials, APIEr
 // Escape encodedQuery string into unescaped list of query params, returns error
 // if any while unescaping the values.
 func unescapeQueries(encodedQuery string) (unescapedQueries []string, err error) {
-	for _, query := range strings.Split(encodedQuery, "&") {
+	for query := range strings.SplitSeq(encodedQuery, "&") {
 		var unescapedQuery string
 		unescapedQuery, err = url.QueryUnescape(query)
 		if err != nil {
@@ -105,7 +107,8 @@ func unescapeQueries(encodedQuery string) (unescapedQueries []string, err error)
 }
 
 // doesPresignV2SignatureMatch - Verify query headers with presigned signature
-//     - http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationQueryStringAuth
+//   - http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationQueryStringAuth
+//
 // returns ErrNone if matches. S3 errors otherwise.
 func doesPresignV2SignatureMatch(r *http.Request) APIErrorCode {
 	// r.RequestURI will have raw encoded URI as sent by the client.
@@ -153,7 +156,7 @@ func doesPresignV2SignatureMatch(r *http.Request) APIErrorCode {
 		return ErrInvalidQueryParams
 	}
 
-	cred, _, s3Err := checkKeyValid(accessKey)
+	cred, _, s3Err := checkKeyValid(r, accessKey)
 	if s3Err != ErrNone {
 		return s3Err
 	}
@@ -179,12 +182,14 @@ func doesPresignV2SignatureMatch(r *http.Request) APIErrorCode {
 		return ErrSignatureDoesNotMatch
 	}
 
+	r.Form.Del(xhttp.Expires)
+
 	return ErrNone
 }
 
 func getReqAccessKeyV2(r *http.Request) (auth.Credentials, bool, APIErrorCode) {
-	if accessKey := r.URL.Query().Get(xhttp.AmzAccessKeyID); accessKey != "" {
-		return checkKeyValid(accessKey)
+	if accessKey := r.Form.Get(xhttp.AmzAccessKeyID); accessKey != "" {
+		return checkKeyValid(r, accessKey)
 	}
 
 	// below is V2 Signed Auth header format, splitting on `space` (after the `AWS` string).
@@ -194,13 +199,13 @@ func getReqAccessKeyV2(r *http.Request) (auth.Credentials, bool, APIErrorCode) {
 		return auth.Credentials{}, false, ErrMissingFields
 	}
 
-	// Then will be splitting on ":", this will seprate `AWSAccessKeyId` and `Signature` string.
+	// Then will be splitting on ":", this will separate `AWSAccessKeyId` and `Signature` string.
 	keySignFields := strings.Split(strings.TrimSpace(authFields[1]), ":")
 	if len(keySignFields) != 2 {
 		return auth.Credentials{}, false, ErrMissingFields
 	}
 
-	return checkKeyValid(keySignFields[0])
+	return checkKeyValid(r, keySignFields[0])
 }
 
 // Authorization = "AWS" + " " + AWSAccessKeyId + ":" + Signature;

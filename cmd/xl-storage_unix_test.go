@@ -1,3 +1,4 @@
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 // +build linux darwin dragonfly freebsd netbsd openbsd
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -20,8 +21,6 @@
 package cmd
 
 import (
-	"context"
-	"io/ioutil"
 	"os"
 	"path"
 	"syscall"
@@ -38,10 +37,7 @@ func getUmask() int {
 
 // Tests if the directory and file creations happen with proper umask.
 func TestIsValidUmaskVol(t *testing.T) {
-	tmpPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatalf("Initializing temporary directory failed with %s.", err)
-	}
+	tmpPath := t.TempDir()
 	testCases := []struct {
 		volName       string
 		expectedUmask int
@@ -58,10 +54,9 @@ func TestIsValidUmaskVol(t *testing.T) {
 
 	// Attempt to create a volume to verify the permissions later.
 	// MakeVol creates 0777.
-	if err = disk.MakeVol(context.Background(), testCase.volName); err != nil {
+	if err = disk.MakeVol(t.Context(), testCase.volName); err != nil {
 		t.Fatalf("Creating a volume failed with %s expected to pass.", err)
 	}
-	defer os.RemoveAll(tmpPath)
 
 	// Stat to get permissions bits.
 	st, err := os.Stat(path.Join(tmpPath, testCase.volName))
@@ -70,7 +65,7 @@ func TestIsValidUmaskVol(t *testing.T) {
 	}
 
 	// Get umask of the bits stored.
-	currentUmask := 0777 - uint32(st.Mode().Perm())
+	currentUmask := 0o777 - uint32(st.Mode().Perm())
 
 	// Verify if umask is correct.
 	if int(currentUmask) != testCase.expectedUmask {
@@ -80,10 +75,7 @@ func TestIsValidUmaskVol(t *testing.T) {
 
 // Tests if the file creations happen with proper umask.
 func TestIsValidUmaskFile(t *testing.T) {
-	tmpPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatalf("Initializing temporary directory failed with %s.", err)
-	}
+	tmpPath := t.TempDir()
 	testCases := []struct {
 		volName       string
 		expectedUmask int
@@ -100,20 +92,18 @@ func TestIsValidUmaskFile(t *testing.T) {
 
 	// Attempt to create a volume to verify the permissions later.
 	// MakeVol creates directory with 0777 perms.
-	if err = disk.MakeVol(context.Background(), testCase.volName); err != nil {
+	if err = disk.MakeVol(t.Context(), testCase.volName); err != nil {
 		t.Fatalf("Creating a volume failed with %s expected to pass.", err)
 	}
 
-	defer os.RemoveAll(tmpPath)
-
 	// Attempt to create a file to verify the permissions later.
 	// AppendFile creates file with 0666 perms.
-	if err = disk.AppendFile(context.Background(), testCase.volName, pathJoin("hello-world.txt", xlStorageFormatFile), []byte("Hello World")); err != nil {
+	if err = disk.AppendFile(t.Context(), testCase.volName, pathJoin("hello-world.txt", xlStorageFormatFile), []byte("Hello World")); err != nil {
 		t.Fatalf("Create a file `test` failed with %s expected to pass.", err)
 	}
 
 	// CheckFile - stat the file.
-	if err := disk.CheckFile(context.Background(), testCase.volName, "hello-world.txt"); err != nil {
+	if _, err := disk.StatInfoFile(t.Context(), testCase.volName, "hello-world.txt/"+xlStorageFormatFile, false); err != nil {
 		t.Fatalf("Stat failed with %s expected to pass.", err)
 	}
 }

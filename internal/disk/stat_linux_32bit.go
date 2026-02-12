@@ -1,3 +1,4 @@
+//go:build (linux && arm) || (linux && 386)
 // +build linux,arm linux,386
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -20,6 +21,7 @@
 package disk
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"syscall"
@@ -56,7 +58,7 @@ func getFSType(ftype int32) string {
 }
 
 // GetInfo returns total and free bytes available in a directory, e.g. `/`.
-func GetInfo(path string) (info Info, err error) {
+func GetInfo(path string, _ bool) (info Info, err error) {
 	s := syscall.Statfs_t{}
 	err = syscall.Statfs(path, &s)
 	if err != nil {
@@ -75,8 +77,13 @@ func GetInfo(path string) (info Info, err error) {
 	// XFS can show wrong values at times error out
 	// in such scenarios.
 	if info.Free > info.Total {
-		return info, fmt.Errorf("detected free space (%d) > total disk space (%d), fs corruption at (%s). please run 'fsck'", info.Free, info.Total, path)
+		return info, fmt.Errorf("detected free space (%d) > total drive space (%d), fs corruption at (%s). please run 'fsck'", info.Free, info.Total, path)
 	}
 	info.Used = info.Total - info.Free
 	return info, nil
+}
+
+// GetDriveStats returns IO stats of the drive by its major:minor
+func GetDriveStats(major, minor uint32) (iostats IOStats, err error) {
+	return IOStats{}, errors.New("operation unsupported")
 }

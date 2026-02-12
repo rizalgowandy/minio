@@ -1,3 +1,4 @@
+//go:build !netbsd && !solaris
 // +build !netbsd,!solaris
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -20,21 +21,13 @@
 package disk_test
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
 
 	"github.com/minio/minio/internal/disk"
 )
 
 func TestFree(t *testing.T) {
-	path, err := ioutil.TempDir(os.TempDir(), "minio-")
-	defer os.RemoveAll(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	di, err := disk.GetInfo(path)
+	di, err := disk.GetInfo(t.TempDir(), true)
 	if err != nil {
 		t.Fatal(err)
 	}

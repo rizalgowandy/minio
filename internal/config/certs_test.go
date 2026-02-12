@@ -18,17 +18,15 @@
 package config
 
 import (
-	"fmt"
-	"io/ioutil"
 	"os"
-	"runtime"
 	"testing"
 )
 
-func createTempFile(prefix, content string) (tempFile string, err error) {
+func createTempFile(t testing.TB, prefix, content string) (tempFile string, err error) {
+	t.Helper()
 	var tmpfile *os.File
 
-	if tmpfile, err = ioutil.TempFile("", prefix); err != nil {
+	if tmpfile, err = os.CreateTemp(t.TempDir(), prefix); err != nil {
 		return tempFile, err
 	}
 
@@ -45,14 +43,13 @@ func createTempFile(prefix, content string) (tempFile string, err error) {
 }
 
 func TestParsePublicCertFile(t *testing.T) {
-	tempFile1, err := createTempFile("public-cert-file", "")
+	tempFile1, err := createTempFile(t, "public-cert-file", "")
 	if err != nil {
 		t.Fatalf("Unable to create temporary file. %v", err)
 	}
 	defer os.Remove(tempFile1)
 
-	tempFile2, err := createTempFile("public-cert-file",
-		`-----BEGIN CERTIFICATE-----
+	tempFile2, err := createTempFile(t, "public-cert-file", `-----BEGIN CERTIFICATE-----
 MIICdTCCAd4CCQCO5G/W1xcE9TANBgkqhkiG9w0BAQUFADB/MQswCQYDVQQGEwJa
 WTEOMAwGA1UECBMFTWluaW8xETAPBgNVBAcTCEludGVybmV0MQ4wDAYDVQQKEwVN
 aW5pbzEOMAwGA1UECxMFTWluaW8xDjAMBgNVBAMTBU1pbmlvMR0wGwYJKoZIhvcN
@@ -73,8 +70,7 @@ M9ofSEt/bdRD
 	}
 	defer os.Remove(tempFile2)
 
-	tempFile3, err := createTempFile("public-cert-file",
-		`-----BEGIN CERTIFICATE-----
+	tempFile3, err := createTempFile(t, "public-cert-file", `-----BEGIN CERTIFICATE-----
 MIICdTCCAd4CCQCO5G/W1xcE9TANBgkqhkiG9w0BAQUFADB/MQswCQYDVQQGEwJa
 WTEOMAwGA1UECBMFTWluaW8xETAPBgNVBAcTCEludGVybmV0MQ4wDAYDVQQKEwVN
 aW5pbzEOMAwGA1UECxMFTWluaW8xDjAMBgNVBAMTBU1pbmlvMR0wGwYJKoZIhvcN
@@ -95,8 +91,7 @@ M9ofSEt/bdRD
 	}
 	defer os.Remove(tempFile3)
 
-	tempFile4, err := createTempFile("public-cert-file",
-		`-----BEGIN CERTIFICATE-----
+	tempFile4, err := createTempFile(t, "public-cert-file", `-----BEGIN CERTIFICATE-----
 MIICdTCCAd4CCQCO5G/W1xcE9TANBgkqhkiG9w0BAQUFADB/MQswCQYDVQQGEwJa
 WTEOMAwGA1UECBMFTWluaW8xETAPBgNVBAcTCEludGVybmV0MQ4wDAYDVQQKEwVN
 aW5pbzEOMAwGA1UECxMFTWluaW8xDjAMBgNVBAMTBU1pbmlvMR0wGwYJKoZIhvcN
@@ -117,8 +112,7 @@ M9ofSEt/bdRD
 	}
 	defer os.Remove(tempFile4)
 
-	tempFile5, err := createTempFile("public-cert-file",
-		`-----BEGIN CERTIFICATE-----
+	tempFile5, err := createTempFile(t, "public-cert-file", `-----BEGIN CERTIFICATE-----
 MIICdTCCAd4CCQCO5G/W1xcE9TANBgkqhkiG9w0BAQUFADB/MQswCQYDVQQGEwJa
 WTEOMAwGA1UECBMFTWluaW8xETAPBgNVBAcTCEludGVybmV0MQ4wDAYDVQQKEwVN
 aW5pbzEOMAwGA1UECxMFTWluaW8xDjAMBgNVBAMTBU1pbmlvMR0wGwYJKoZIhvcN
@@ -155,39 +149,27 @@ M9ofSEt/bdRD
 	}
 	defer os.Remove(tempFile5)
 
-	nonexistentErr := fmt.Errorf("open nonexistent-file: no such file or directory")
-	if runtime.GOOS == "windows" {
-		// Below concatenation is done to get rid of goline error
-		// "error strings should not be capitalized or end with punctuation or a newline"
-		nonexistentErr = fmt.Errorf("open nonexistent-file:" + " The system cannot find the file specified.")
-	}
-
 	testCases := []struct {
 		certFile          string
 		expectedResultLen int
-		expectedErr       error
+		expectedErr       bool
 	}{
-		{"nonexistent-file", 0, nonexistentErr},
-		{tempFile1, 0, fmt.Errorf("Empty public certificate file %s", tempFile1)},
-		{tempFile2, 0, fmt.Errorf("Could not read PEM block from file %s", tempFile2)},
-		{tempFile3, 0, fmt.Errorf("asn1: structure error: sequence tag mismatch")},
-		{tempFile4, 1, nil},
-		{tempFile5, 2, nil},
+		{"nonexistent-file", 0, true},
+		{tempFile1, 0, true},
+		{tempFile2, 0, true},
+		{tempFile3, 0, true},
+		{tempFile4, 1, false},
+		{tempFile5, 2, false},
 	}
 
 	for _, testCase := range testCases {
 		certs, err := ParsePublicCertFile(testCase.certFile)
-
-		if testCase.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
-			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
+		if !testCase.expectedErr && err != nil {
+			t.Fatalf("error: expected = <nil>, got = %v", err)
 		}
-
+		if testCase.expectedErr && err == nil {
+			t.Fatal("error: expected err, got = <nil>")
+		}
 		if len(certs) != testCase.expectedResultLen {
 			t.Fatalf("certs: expected = %v, got = %v", testCase.expectedResultLen, len(certs))
 		}
@@ -195,20 +177,22 @@ M9ofSEt/bdRD
 }
 
 func TestLoadX509KeyPair(t *testing.T) {
+	t.Cleanup(func() {
+		os.Unsetenv(EnvCertPassword)
+	})
 	for i, testCase := range loadX509KeyPairTests {
-		privateKey, err := createTempFile("private.key", testCase.privateKey)
+		privateKey, err := createTempFile(t, "private.key", testCase.privateKey)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create tmp private key file: %v", i, err)
 		}
-		certificate, err := createTempFile("public.crt", testCase.certificate)
+		certificate, err := createTempFile(t, "public.crt", testCase.certificate)
 		if err != nil {
 			os.Remove(privateKey)
 			t.Fatalf("Test %d: failed to create tmp certificate file: %v", i, err)
 		}
 
-		os.Unsetenv(EnvCertPassword)
 		if testCase.password != "" {
-			os.Setenv(EnvCertPassword, testCase.password)
+			t.Setenv(EnvCertPassword, testCase.password)
 		}
 		_, err = LoadX509KeyPair(certificate, privateKey)
 		if err != nil && !testCase.shouldFail {
@@ -227,6 +211,32 @@ var loadX509KeyPairTests = []struct {
 	privateKey, certificate string
 	shouldFail              bool
 }{
+	{
+		password:   "",
+		privateKey: "",
+		certificate: `-----BEGIN CERTIFICATE-----
+MIIDiTCCAnGgAwIBAgIJAK5m5S7EE46kMA0GCSqGSIb3DQEBCwUAMFsxCzAJBgNV
+BAYTAlVTMQ4wDAYDVQQIDAVzdGF0ZTERMA8GA1UEBwwIbG9jYXRpb24xFTATBgNV
+BAoMDG9yZ2FuaXphdGlvbjESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTE3MTIxODE4
+MDUyOFoXDTI3MTIxNjE4MDUyOFowWzELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBXN0
+YXRlMREwDwYDVQQHDAhsb2NhdGlvbjEVMBMGA1UECgwMb3JnYW5pemF0aW9uMRIw
+EAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIB
+AQDPJfYY5Dhsntrqwyu7ZgKM/zrlKEjCwGHhWJBdZdeZCHQlY8ISrtDxxp2XMmI6
+HsszalEhNF9fk3vSXWclTuomG03fgGzP4R6QpcwGUCxhRF1J+0b64Yi8pw2uEGsR
+GuMwLhGorcWalNoihgHc0BQ4vO8aaTNTX7iD06olesP6vGNu/S8h0VomE+0v9qYc
+VF66Zaiv/6OmxAtDpElJjVd0mY7G85BlDlFrVwzd7zhRiuJZ4iDg749Xt9GuuKla
+Dvr14glHhP4dQgUbhluJmIHMdx2ZPjk+5FxaDK6I9IUpxczFDe4agDE6lKzU1eLd
+cCXRWFOf6q9lTB1hUZfmWfTxAgMBAAGjUDBOMB0GA1UdDgQWBBTQh7lDTq+8salD
+0HBNILochiiNaDAfBgNVHSMEGDAWgBTQh7lDTq+8salD0HBNILochiiNaDAMBgNV
+HRMEBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAqi9LycxcXKNSDXaPkCKvw7RQy
+iMBDGm1kIY++p3tzbUGuaeu85TsswKnqd50AullEU+aQxRRJGfR8eSKzQJMBXLMQ
+b4ptYCc5OrZtRHT8NaZ/df2tc6I88kN8dBu6ybcNGsevXA/iNX3kKLW7naxdr5jj
+KUudWSuqDCjCmQa5bYb9H6DreLH2lUItSWBa/YmeZ3VSezDCd+XYO53QKwZVj8Jb
+bulZmoo7e7HO1qecEzWKL10UYyEbG3UDPtw+NZc142ZYeEhXQ0dsstGAO5hf3hEl
+kQyKGUTpDbKLuyYMFsoH73YLjBqNe+UEhPwE+FWpcky1Sp9RTx/oMLpiZaPR
+-----END CERTIFICATE-----`,
+		shouldFail: true,
+	},
 	{
 		password: "foobar",
 		privateKey: `-----BEGIN RSA PRIVATE KEY-----

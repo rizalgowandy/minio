@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -89,7 +90,7 @@ func parseDiscoveryDoc(ustr string) (DiscoveryDoc, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return d, err
+		return d, fmt.Errorf("unexpected error returned by %s : status(%s)", ustr, resp.Status)
 	}
 	dec := json.NewDecoder(resp.Body)
 	if err = dec.Decode(&d); err != nil {

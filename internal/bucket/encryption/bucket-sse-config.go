@@ -15,13 +15,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package cmd
+package sse
 
 import (
 	"encoding/xml"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
@@ -29,16 +30,16 @@ import (
 
 const (
 	// AES256 is used with SSE-S3
-	AES256 SSEAlgorithm = "AES256"
+	AES256 Algorithm = "AES256"
 	// AWSKms is used with SSE-KMS
-	AWSKms SSEAlgorithm = "aws:kms"
+	AWSKms Algorithm = "aws:kms"
 )
 
-// SSEAlgorithm - represents valid SSE algorithms supported; currently only AES256 is supported
-type SSEAlgorithm string
+// Algorithm - represents valid SSE algorithms supported; currently only AES256 is supported
+type Algorithm string
 
 // UnmarshalXML - Unmarshals XML tag to valid SSE algorithm
-func (alg *SSEAlgorithm) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+func (alg *Algorithm) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	var s string
 	if err := d.DecodeElement(&s, &start); err != nil {
 		return err
@@ -57,18 +58,18 @@ func (alg *SSEAlgorithm) UnmarshalXML(d *xml.Decoder, start xml.StartElement) er
 }
 
 // MarshalXML - Marshals given SSE algorithm to valid XML
-func (alg *SSEAlgorithm) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+func (alg *Algorithm) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	return e.EncodeElement(string(*alg), start)
 }
 
 // EncryptionAction - for ApplyServerSideEncryptionByDefault XML tag
 type EncryptionAction struct {
-	Algorithm   SSEAlgorithm `xml:"SSEAlgorithm,omitempty"`
-	MasterKeyID string       `xml:"KMSMasterKeyID,omitempty"`
+	Algorithm   Algorithm `xml:"SSEAlgorithm,omitempty"`
+	MasterKeyID string    `xml:"KMSMasterKeyID,omitempty"`
 }
 
-// SSERule - for ServerSideEncryptionConfiguration XML tag
-type SSERule struct {
+// Rule - for ServerSideEncryptionConfiguration XML tag
+type Rule struct {
 	DefaultEncryptionAction EncryptionAction `xml:"ApplyServerSideEncryptionByDefault"`
 }
 
@@ -76,9 +77,9 @@ const xmlNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 // BucketSSEConfig - represents default bucket encryption configuration
 type BucketSSEConfig struct {
-	XMLNS   string    `xml:"xmlns,attr,omitempty"`
-	XMLName xml.Name  `xml:"ServerSideEncryptionConfiguration"`
-	Rules   []SSERule `xml:"Rule"`
+	XMLNS   string   `xml:"xmlns,attr,omitempty"`
+	XMLName xml.Name `xml:"ServerSideEncryptionConfiguration"`
+	Rules   []Rule   `xml:"Rule"`
 }
 
 // ParseBucketSSEConfig - Decodes given XML to a valid default bucket encryption config
@@ -102,8 +103,13 @@ func ParseBucketSSEConfig(r io.Reader) (*BucketSSEConfig, error) {
 				return nil, errors.New("MasterKeyID is allowed with aws:kms only")
 			}
 		case AWSKms:
-			if rule.DefaultEncryptionAction.MasterKeyID == "" {
+			keyID := rule.DefaultEncryptionAction.MasterKeyID
+			if keyID == "" {
 				return nil, errors.New("MasterKeyID is missing with aws:kms")
+			}
+			spaces := strings.HasPrefix(keyID, " ") || strings.HasSuffix(keyID, " ")
+			if spaces {
+				return nil, errors.New("MasterKeyID contains unsupported characters")
 			}
 		}
 	}
@@ -114,24 +120,30 @@ func ParseBucketSSEConfig(r io.Reader) (*BucketSSEConfig, error) {
 	return &config, nil
 }
 
+// ApplyOptions ask for specific features to be enabled,
+// when bucketSSEConfig is empty.
+type ApplyOptions struct {
+	AutoEncrypt bool
+}
+
 // Apply applies the SSE bucket configuration on the given HTTP headers and
 // sets the specified SSE headers.
 //
 // Apply does not overwrite any existing SSE headers. Further, it will
 // set minimal SSE-KMS headers if autoEncrypt is true and the BucketSSEConfig
 // is nil.
-func (b *BucketSSEConfig) Apply(headers http.Header, autoEncrypt bool) {
-	if _, ok := crypto.IsRequested(headers); ok {
+func (b *BucketSSEConfig) Apply(headers http.Header, opts ApplyOptions) {
+	if crypto.Requested(headers) {
 		return
 	}
 	if b == nil {
-		if autoEncrypt {
+		if opts.AutoEncrypt {
 			headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
 		}
 		return
 	}
 
-	switch b.Algorithm() {
+	switch b.Algo() {
 	case xhttp.AmzEncryptionAES:
 		headers.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
 	case xhttp.AmzEncryptionKMS:
@@ -140,8 +152,8 @@ func (b *BucketSSEConfig) Apply(headers http.Header, autoEncrypt bool) {
 	}
 }
 
-// Algorithm returns the SSE algorithm specified by the SSE configuration.
-func (b *BucketSSEConfig) Algorithm() SSEAlgorithm {
+// Algo returns the SSE algorithm specified by the SSE configuration.
+func (b *BucketSSEConfig) Algo() Algorithm {
 	for _, rule := range b.Rules {
 		return rule.DefaultEncryptionAction.Algorithm
 	}
@@ -153,7 +165,7 @@ func (b *BucketSSEConfig) Algorithm() SSEAlgorithm {
 // empty key ID.
 func (b *BucketSSEConfig) KeyID() string {
 	for _, rule := range b.Rules {
-		return rule.DefaultEncryptionAction.MasterKeyID
+		return strings.TrimPrefix(rule.DefaultEncryptionAction.MasterKeyID, crypto.ARNPrefix)
 	}
 	return ""
 }

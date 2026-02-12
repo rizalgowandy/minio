@@ -25,40 +25,14 @@ import (
 	"strings"
 )
 
-// StatusType of Replication for x-amz-replication-status header
-type StatusType string
-
-const (
-	// Pending - replication is pending.
-	Pending StatusType = "PENDING"
-
-	// Completed - replication completed ok.
-	Completed StatusType = "COMPLETED"
-
-	// Failed - replication failed.
-	Failed StatusType = "FAILED"
-
-	// Replica - this is a replica.
-	Replica StatusType = "REPLICA"
-)
-
-// String returns string representation of status
-func (s StatusType) String() string {
-	return string(s)
-}
-
-// Empty returns true if this status is not set
-func (s StatusType) Empty() bool {
-	return string(s) == ""
-}
-
 var (
-	errReplicationTooManyRules        = Errorf("Replication configuration allows a maximum of 1000 rules")
-	errReplicationNoRule              = Errorf("Replication configuration should have at least one rule")
-	errReplicationUniquePriority      = Errorf("Replication configuration has duplicate priority")
-	errReplicationDestinationMismatch = Errorf("The destination bucket must be same for all rules")
-	errRoleArnMissing                 = Errorf("Missing required parameter `Role` in ReplicationConfiguration")
-	errInvalidSourceSelectionCriteria = Errorf("Invalid ReplicaModification status")
+	errReplicationTooManyRules          = Errorf("Replication configuration allows a maximum of 1000 rules")
+	errReplicationNoRule                = Errorf("Replication configuration should have at least one rule")
+	errReplicationUniquePriority        = Errorf("Replication configuration has duplicate priority")
+	errRoleArnMissingLegacy             = Errorf("Missing required parameter `Role` in ReplicationConfiguration")
+	errDestinationArnMissing            = Errorf("Missing required parameter `Destination` in Replication rule")
+	errInvalidSourceSelectionCriteria   = Errorf("Invalid ReplicaModification status")
+	errRoleArnPresentForMultipleTargets = Errorf("`Role` should be empty in ReplicationConfiguration for multiple targets")
 )
 
 // Config - replication configuration specified in
@@ -88,6 +62,12 @@ func ParseConfig(reader io.Reader) (*Config, error) {
 				},
 			}
 		}
+		// Default DeleteReplication to disabled if unset.
+		if len(config.Rules[i].DeleteReplication.Status) == 0 {
+			config.Rules[i].DeleteReplication = DeleteReplication{
+				Status: Disabled,
+			}
+		}
 	}
 	return &config, nil
 }
@@ -102,18 +82,14 @@ func (c Config) Validate(bucket string, sameTarget bool) error {
 	if len(c.Rules) == 0 {
 		return errReplicationNoRule
 	}
-	if c.RoleArn == "" {
-		return errRoleArnMissing
-	}
+
 	// Validate all the rules in the replication config
 	targetMap := make(map[string]struct{})
 	priorityMap := make(map[string]struct{})
+	var legacyArn bool
 	for _, r := range c.Rules {
-		if len(targetMap) == 0 {
-			targetMap[r.Destination.Bucket] = struct{}{}
-		}
 		if _, ok := targetMap[r.Destination.Bucket]; !ok {
-			return errReplicationDestinationMismatch
+			targetMap[r.Destination.Bucket] = struct{}{}
 		}
 		if err := r.Validate(bucket, sameTarget); err != nil {
 			return err
@@ -122,12 +98,25 @@ func (c Config) Validate(bucket string, sameTarget bool) error {
 			return errReplicationUniquePriority
 		}
 		priorityMap[strconv.Itoa(r.Priority)] = struct{}{}
+
+		if r.Destination.LegacyArn() {
+			legacyArn = true
+		}
+		if c.RoleArn == "" && !r.Destination.TargetArn() {
+			return errDestinationArnMissing
+		}
+	}
+	// disallow combining old replication configuration which used RoleArn as target ARN with multiple
+	// destination replication
+	if c.RoleArn != "" && len(targetMap) > 1 {
+		return errRoleArnPresentForMultipleTargets
+	}
+	// validate RoleArn if destination used legacy ARN format.
+	if c.RoleArn == "" && legacyArn {
+		return errRoleArnMissingLegacy
 	}
 	return nil
 }
-
-// Type - replication type enum
-type Type int
 
 // Types of replication
 const (
@@ -137,11 +126,22 @@ const (
 	MetadataReplicationType
 	HealReplicationType
 	ExistingObjectReplicationType
+	ResyncReplicationType
+	AllReplicationType
 )
 
 // Valid returns true if replication type is set
 func (t Type) Valid() bool {
 	return t > 0
+}
+
+// IsDataReplication returns true if content being replicated
+func (t Type) IsDataReplication() bool {
+	switch t {
+	case ObjectReplicationType, HealReplicationType, ExistingObjectReplicationType:
+		return true
+	}
+	return false
 }
 
 // ObjectOpts provides information to deduce whether replication
@@ -150,18 +150,33 @@ type ObjectOpts struct {
 	Name           string
 	UserTags       string
 	VersionID      string
-	IsLatest       bool
 	DeleteMarker   bool
 	SSEC           bool
 	OpType         Type
 	Replica        bool
 	ExistingObject bool
+	TargetArn      string
+}
+
+// HasExistingObjectReplication returns true if any of the rule returns 'ExistingObjects' replication.
+func (c Config) HasExistingObjectReplication(arn string) (hasARN, isEnabled bool) {
+	for _, rule := range c.Rules {
+		if rule.Destination.ARN == arn || c.RoleArn == arn {
+			if !hasARN {
+				hasARN = true
+			}
+			if rule.ExistingObjectReplication.Status == Enabled {
+				return true, true
+			}
+		}
+	}
+	return hasARN, false
 }
 
 // FilterActionableRules returns the rules actions that need to be executed
 // after evaluating prefix/tag filtering
 func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
-	if obj.Name == "" {
+	if obj.Name == "" && (obj.OpType != ResyncReplicationType && obj.OpType != AllReplicationType) {
 		return nil
 	}
 	var rules []Rule
@@ -169,16 +184,29 @@ func (c Config) FilterActionableRules(obj ObjectOpts) []Rule {
 		if rule.Status == Disabled {
 			continue
 		}
+
+		if obj.TargetArn != "" && rule.Destination.ARN != obj.TargetArn && c.RoleArn != obj.TargetArn {
+			continue
+		}
+		// Ignore other object level and prefix filters for resyncing target/listing bucket targets
+		if obj.OpType == ResyncReplicationType || obj.OpType == AllReplicationType {
+			rules = append(rules, rule)
+			continue
+		}
+		if obj.ExistingObject && rule.ExistingObjectReplication.Status == Disabled {
+			continue
+		}
 		if !strings.HasPrefix(obj.Name, rule.Prefix()) {
 			continue
 		}
-		if rule.Filter.TestTags(strings.Split(obj.UserTags, "&")) {
+		if rule.Filter.TestTags(obj.UserTags) {
 			rules = append(rules, rule)
 		}
 	}
-	sort.Slice(rules[:], func(i, j int) bool {
-		return rules[i].Priority > rules[j].Priority
+	sort.Slice(rules, func(i, j int) bool {
+		return rules[i].Priority > rules[j].Priority && rules[i].Destination.String() == rules[j].Destination.String()
 	})
+
 	return rules
 }
 
@@ -192,9 +220,6 @@ func (c Config) GetDestination() Destination {
 
 // Replicate returns true if the object should be replicated.
 func (c Config) Replicate(obj ObjectOpts) bool {
-	if obj.SSEC {
-		return false
-	}
 	for _, rule := range c.FilterActionableRules(obj) {
 		if rule.Status == Disabled {
 			continue
@@ -205,7 +230,7 @@ func (c Config) Replicate(obj ObjectOpts) bool {
 		if obj.OpType == DeleteReplicationType {
 			switch {
 			case obj.VersionID != "":
-				// // check MinIO extension for versioned deletes
+				// check MinIO extension for versioned deletes
 				return rule.DeleteReplication.Status == Enabled
 			default:
 				return rule.DeleteMarkerReplication.Status == Enabled
@@ -242,4 +267,28 @@ func (c Config) HasActiveRules(prefix string, recursive bool) bool {
 		return true
 	}
 	return false
+}
+
+// FilterTargetArns returns a slice of distinct target arns in the config
+func (c Config) FilterTargetArns(obj ObjectOpts) []string {
+	var arns []string
+
+	tgtsMap := make(map[string]struct{})
+	rules := c.FilterActionableRules(obj)
+	for _, rule := range rules {
+		if rule.Status == Disabled {
+			continue
+		}
+		if c.RoleArn != "" {
+			arns = append(arns, c.RoleArn) // use legacy RoleArn if present
+			return arns
+		}
+		if _, ok := tgtsMap[rule.Destination.ARN]; !ok {
+			tgtsMap[rule.Destination.ARN] = struct{}{}
+		}
+	}
+	for k := range tgtsMap {
+		arns = append(arns, k)
+	}
+	return arns
 }

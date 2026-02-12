@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -39,7 +40,9 @@ var mountPointCache sync.Map
 func IsLikelyMountPoint(path string) bool {
 	path = filepath.Dir(path)
 	if v, ok := mountPointCache.Load(path); ok {
-		return v.(bool)
+		if b, ok := v.(bool); ok {
+			return b
+		}
 	}
 	wpath, _ := windows.UTF16PtrFromString(path)
 	wvolume := make([]uint16, len(path)+1)

@@ -19,23 +19,27 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"runtime"
+	"strconv"
 	"time"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/pkg/v3/env"
 )
 
 // healTask represents what to heal along with options
-//   path: '/' =>  Heal disk formats along with metadata
-//   path: 'bucket/' or '/bucket/' => Heal bucket
-//   path: 'bucket/object' => Heal object
+//
+//	path: '/' =>  Heal disk formats along with metadata
+//	path: 'bucket/' or '/bucket/' => Heal bucket
+//	path: 'bucket/object' => Heal object
 type healTask struct {
 	bucket    string
 	object    string
 	versionID string
 	opts      madmin.HealOpts
 	// Healing response will be sent here
-	responseCh chan healResult
+	respCh chan healResult
 }
 
 // healResult represents a healing result with a possible error
@@ -46,54 +50,67 @@ type healResult struct {
 
 // healRoutine receives heal tasks, to heal buckets, objects and format.json
 type healRoutine struct {
-	tasks  chan healTask
-	doneCh chan struct{}
+	tasks   chan healTask
+	workers int
 }
 
-// Add a new task in the tasks queue
-func (h *healRoutine) queueHealTask(task healTask) {
-	h.tasks <- task
+func activeListeners() int {
+	// Bucket notification and http trace are not costly, it is okay to ignore them
+	// while counting the number of concurrent connections
+	return int(globalHTTPListen.Subscribers()) + int(globalTrace.Subscribers())
 }
 
-func waitForLowHTTPReq(maxIO int, maxWait time.Duration) {
+func waitForLowIO(maxIO int, maxWait time.Duration, currentIO func() int) {
 	// No need to wait run at full speed.
 	if maxIO <= 0 {
 		return
 	}
 
-	// At max 10 attempts to wait with 100 millisecond interval before proceeding
-	waitTick := 100 * time.Millisecond
-
-	// Bucket notification and http trace are not costly, it is okay to ignore them
-	// while counting the number of concurrent connections
-	maxIOFn := func() int {
-		return maxIO + int(globalHTTPListen.NumSubscribers()) + int(globalTrace.NumSubscribers())
-	}
+	const waitTick = 100 * time.Millisecond
 
 	tmpMaxWait := maxWait
-	if httpServer := newHTTPServerFn(); httpServer != nil {
-		// Any requests in progress, delay the heal.
-		for httpServer.GetRequestCount() >= maxIOFn() {
-			if tmpMaxWait > 0 {
-				if tmpMaxWait < waitTick {
-					time.Sleep(tmpMaxWait)
-				} else {
-					time.Sleep(waitTick)
-				}
-				tmpMaxWait = tmpMaxWait - waitTick
+
+	for currentIO() >= maxIO {
+		if tmpMaxWait > 0 {
+			if tmpMaxWait < waitTick {
+				time.Sleep(tmpMaxWait)
+				return
 			}
-			if tmpMaxWait <= 0 {
-				if intDataUpdateTracker.debug {
-					logger.Info("waitForLowHTTPReq: waited max %s, resuming", maxWait)
-				}
-				break
-			}
+			time.Sleep(waitTick)
+			tmpMaxWait -= waitTick
+		}
+		if tmpMaxWait <= 0 {
+			return
 		}
 	}
 }
 
+func currentHTTPIO() int {
+	httpServer := newHTTPServerFn()
+	if httpServer == nil {
+		return 0
+	}
+
+	return httpServer.GetRequestCount() - activeListeners()
+}
+
+func waitForLowHTTPReq() {
+	maxIO, maxWait, _ := globalHealConfig.Clone()
+	waitForLowIO(maxIO, maxWait, currentHTTPIO)
+}
+
+func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
+	bgSeq := newBgHealSequence()
+	// Run the background healer
+	for range globalBackgroundHealRoutine.workers {
+		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI, bgSeq)
+	}
+
+	globalBackgroundHealState.LaunchNewHealSequence(bgSeq, objAPI)
+}
+
 // Wait for heal requests and process them
-func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
+func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer, bgSeq *healSequence) {
 	for {
 		select {
 		case task, ok := <-h.tasks:
@@ -105,7 +122,7 @@ func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 			var err error
 			switch task.bucket {
 			case nopHeal:
-				continue
+				err = errSkipFile
 			case SlashSeparator:
 				res, err = healDiskFormat(ctx, objAPI, task.opts)
 			default:
@@ -115,10 +132,21 @@ func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 					res, err = objAPI.HealObject(ctx, task.bucket, task.object, task.versionID, task.opts)
 				}
 			}
-			task.responseCh <- healResult{result: res, err: err}
 
-		case <-h.doneCh:
-			return
+			if task.respCh != nil {
+				task.respCh <- healResult{result: res, err: err}
+				continue
+			}
+
+			// when respCh is not set caller is not waiting but we
+			// update the relevant metrics for them
+			if bgSeq != nil {
+				if err == nil {
+					bgSeq.countHealed(res.Type)
+				} else {
+					bgSeq.countFailed(res.Type)
+				}
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -126,11 +154,24 @@ func (h *healRoutine) run(ctx context.Context, objAPI ObjectLayer) {
 }
 
 func newHealRoutine() *healRoutine {
-	return &healRoutine{
-		tasks:  make(chan healTask),
-		doneCh: make(chan struct{}),
+	workers := runtime.GOMAXPROCS(0) / 2
+
+	if envHealWorkers := env.Get("_MINIO_HEAL_WORKERS", ""); envHealWorkers != "" {
+		if numHealers, err := strconv.Atoi(envHealWorkers); err != nil {
+			bugLogIf(context.Background(), fmt.Errorf("invalid _MINIO_HEAL_WORKERS value: %w", err))
+		} else {
+			workers = numHealers
+		}
 	}
 
+	if workers == 0 {
+		workers = 4
+	}
+
+	return &healRoutine{
+		tasks:   make(chan healTask),
+		workers: workers,
+	}
 }
 
 // healDiskFormat - heals format.json, return value indicates if a
